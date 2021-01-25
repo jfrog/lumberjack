@@ -109,6 +109,10 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// KeepLastDecompressed determines the number of rotated logs to keep decompressed.
+	// This is only used if Compress is true. The default (0) is to compress all rotated logs.
+	KeepLastDecompressed int `json:"keeplastdecompressed" yaml:"keeplastdecompressed"`
+
 	// TimeFormat determines the format to use for formatting the timestamp in
 	// backup files. The default format is defined in `DefaultTimeFormat`.
 	TimeFormat string `json:"timeformat" yaml:"timeformat"`
@@ -379,8 +383,8 @@ func (l *Logger) millRunOnce() error {
 	}
 
 	if l.Compress {
-		for _, f := range files {
-			if !strings.HasSuffix(f.Name(), compressSuffix) {
+		for i, f := range files {
+			if shouldCompressFile(l.KeepLastDecompressed, i, f.Name()) {
 				compress = append(compress, f)
 			}
 		}
@@ -401,6 +405,14 @@ func (l *Logger) millRunOnce() error {
 	}
 
 	return err
+}
+
+func shouldCompressFile(keepLastDecompressed int, fileIndex int, filename string) bool {
+	alreadyCompressed := strings.HasSuffix(filename, compressSuffix)
+	if alreadyCompressed || fileIndex < keepLastDecompressed {
+		return false
+	}
+	return true
 }
 
 // millRun runs in a goroutine to manage post-rotation compression and removal

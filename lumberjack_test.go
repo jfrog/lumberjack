@@ -631,101 +631,167 @@ func TestRotate(t *testing.T) {
 }
 
 func TestCompressOnRotate(t *testing.T) {
-	currentTime = fakeTime
-	megabyte = 1
-
-	dir := makeTempDir("TestCompressOnRotate", t)
-	defer os.RemoveAll(dir)
-
-	filename := logFile(dir)
-	l := &Logger{
-		Compress: true,
-		Filename: filename,
-		MaxSize:  10,
+	tests := []struct {
+		name                 string
+		keepLastDecompressed int
+		verifyFirst          func(string, []byte, testing.TB)
+		verifySecond         func(string, []byte, testing.TB)
+	}{
+		{
+			name:                 "compress all",
+			keepLastDecompressed: 0,
+			verifyFirst:          verifyCompressedFile,
+			verifySecond:         verifyCompressedFile,
+		},
+		{
+			name:                 "keep 1 decompressed",
+			keepLastDecompressed: 1,
+			verifyFirst:          verifyCompressedFile,
+			verifySecond:         existsWithContent,
+		},
+		{
+			name:                 "keep 2 decompressed",
+			keepLastDecompressed: 2,
+			verifyFirst:          existsWithContent,
+			verifySecond:         existsWithContent,
+		},
 	}
-	defer l.Close()
-	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
 
-	existsWithContent(filename, b, t)
-	fileCount(dir, 1, t)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			currentTime = fakeTime
+			megabyte = 1
 
-	newFakeTime()
+			dir := makeTempDir("TestCompressOnRotate", t)
+			defer func() { _ = os.RemoveAll(dir) }()
 
-	err = l.Rotate()
-	isNil(err, t)
+			logFilename := logFile(dir)
+			l := &Logger{
+				Compress:             true,
+				KeepLastDecompressed: test.keepLastDecompressed,
+				Filename:             logFilename,
+				MaxSize:              10,
+			}
+			defer l.Close()
+			booBytes := []byte("boo!")
+			writeToCurrentLog(t, l, logFilename, booBytes)
 
-	// the old logfile should be moved aside and the main logfile should have
-	// nothing in it.
-	existsWithContent(filename, []byte{}, t)
+			fileCount(dir, 1, t)
 
-	// we need to wait a little bit since the files get compressed on a different
-	// goroutine.
-	<-time.After(300 * time.Millisecond)
+			newFakeTime()
+			firstArchiveTime := fakeTime()
 
-	// a compressed version of the log file should now exist and the original
-	// should have been removed.
-	bc := new(bytes.Buffer)
-	gz := gzip.NewWriter(bc)
-	_, err = gz.Write(b)
-	isNil(err, t)
-	err = gz.Close()
-	isNil(err, t)
-	existsWithContent(backupFile(dir)+compressSuffix, bc.Bytes(), t)
-	notExist(backupFile(dir), t)
+			err := l.Rotate()
+			isNil(err, t)
 
-	fileCount(dir, 2, t)
+			// the old logfile should be moved aside and the main logfile should have
+			// nothing in it.
+			oldLogFilename := backupFileWithTime(dir, firstArchiveTime)
+			existsWithContent(oldLogFilename, booBytes, t)
+			existsWithContent(logFilename, []byte{}, t)
+
+			haaBytes := []byte("haaa!")
+			writeToCurrentLog(t, l, logFilename, haaBytes)
+
+			newFakeTime()
+			secondArchiveTime := fakeTime()
+
+			err = l.Rotate()
+			isNil(err, t)
+			// we need to wait a little bit since the files get compressed on a different
+			// goroutine.
+			<-time.After(300 * time.Millisecond)
+
+			test.verifyFirst(backupFileWithTime(dir, firstArchiveTime), booBytes, t)
+			test.verifySecond(backupFileWithTime(dir, secondArchiveTime), haaBytes, t)
+
+			fileCount(dir, 3, t)
+		})
+	}
 }
 
 func TestCompressOnResume(t *testing.T) {
-	currentTime = fakeTime
-	megabyte = 1
-
-	dir := makeTempDir("TestCompressOnResume", t)
-	defer os.RemoveAll(dir)
-
-	filename := logFile(dir)
-	l := &Logger{
-		Compress: true,
-		Filename: filename,
-		MaxSize:  10,
+	tests := []struct {
+		name                 string
+		keepLastDecompressed int
+		expectedFileCount    int
+	}{
+		{
+			name:                 "compress latest",
+			keepLastDecompressed: 0,
+			expectedFileCount:    2,
+		},
+		{
+			name:                 "don't compress latest",
+			keepLastDecompressed: 1,
+			expectedFileCount:    3,
+		},
 	}
-	defer l.Close()
 
-	// Create a backup file and empty "compressed" file.
-	filename2 := backupFile(dir)
-	b := []byte("foo!")
-	err := ioutil.WriteFile(filename2, b, 0644)
-	isNil(err, t)
-	err = ioutil.WriteFile(filename2+compressSuffix, []byte{}, 0644)
-	isNil(err, t)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			currentTime = fakeTime
+			megabyte = 1
 
-	newFakeTime()
+			dir := makeTempDir("TestCompressOnResume", t)
+			defer os.RemoveAll(dir)
 
-	b2 := []byte("boo!")
-	n, err := l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
-	existsWithContent(filename, b2, t)
+			filename := logFile(dir)
+			l := &Logger{
+				Compress:             true,
+				KeepLastDecompressed: test.keepLastDecompressed,
+				Filename:             filename,
+				MaxSize:              10,
+			}
+			defer l.Close()
 
-	// we need to wait a little bit since the files get compressed on a different
-	// goroutine.
-	<-time.After(300 * time.Millisecond)
+			t1 := fakeTime()
+			// Create a backup file and empty "compressed" file.
+			previouslyArchivedFile := backupFileWithTime(dir, t1)
+			fooBytes := []byte("foo!")
+			err := ioutil.WriteFile(previouslyArchivedFile, fooBytes, 0644)
+			isNil(err, t)
+			err = ioutil.WriteFile(previouslyArchivedFile+compressSuffix, []byte{}, 0644)
+			isNil(err, t)
 
+			writeToCurrentLog(t, l, filename, []byte("boo!"))
+			newFakeTime()
+
+			if test.keepLastDecompressed > 0 {
+				// in this case another backup file is needed
+				writeToCurrentLog(t, l, filename, []byte("haaaaa!"))
+				newFakeTime()
+			}
+
+			// we need to wait a little bit since the files get compressed on a different
+			// goroutine.
+			<-time.After(300 * time.Millisecond)
+
+			verifyCompressedFile(previouslyArchivedFile, fooBytes, t)
+			fileCount(dir, test.expectedFileCount, t)
+		})
+	}
+}
+
+func verifyCompressedFile(archivedFilename string, contents []byte, t testing.TB) {
 	// The write should have started the compression - a compressed version of
 	// the log file should now exist and the original should have been removed.
 	bc := new(bytes.Buffer)
 	gz := gzip.NewWriter(bc)
-	_, err = gz.Write(b)
+	_, err := gz.Write(contents)
 	isNil(err, t)
 	err = gz.Close()
 	isNil(err, t)
-	existsWithContent(filename2+compressSuffix, bc.Bytes(), t)
-	notExist(filename2, t)
+	existsWithContent(archivedFilename+compressSuffix, bc.Bytes(), t)
+	notExist(archivedFilename, t)
+}
 
-	fileCount(dir, 2, t)
+func writeToCurrentLog(t *testing.T, l *Logger, filename string, contents []byte) {
+	b := contents
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+	existsWithContent(filename, b, t)
 }
 
 func TestJson(t *testing.T) {
@@ -737,6 +803,7 @@ func TestJson(t *testing.T) {
 	"maxbackups": 3,
 	"localtime": true,
 	"compress": true,
+	"keeplastdecompressed": 2,
 	"timeformat": "1:2.3",
 	"backupdir": "bar"
 }`[1:])
@@ -750,6 +817,7 @@ func TestJson(t *testing.T) {
 	equals(3, l.MaxBackups, t)
 	equals(true, l.LocalTime, t)
 	equals(true, l.Compress, t)
+	equals(2, l.KeepLastDecompressed, t)
 	equals("1:2.3", l.TimeFormat, t)
 	equals("bar", l.BackupDir, t)
 }
@@ -762,6 +830,7 @@ maxage: 10
 maxbackups: 3
 localtime: true
 compress: true
+keeplastdecompressed: 2
 timeformat: 1:2.3
 backupdir: bar`[1:])
 
@@ -774,6 +843,7 @@ backupdir: bar`[1:])
 	equals(3, l.MaxBackups, t)
 	equals(true, l.LocalTime, t)
 	equals(true, l.Compress, t)
+	equals(2, l.KeepLastDecompressed, t)
 	equals("1:2.3", l.TimeFormat, t)
 	equals("bar", l.BackupDir, t)
 }
@@ -786,6 +856,7 @@ maxage = 10
 maxbackups = 3
 localtime = true
 compress = true
+keeplastdecompressed = 2
 timeformat = "1:2.3"
 backupdir = "bar"`[1:]
 
@@ -798,9 +869,56 @@ backupdir = "bar"`[1:]
 	equals(3, l.MaxBackups, t)
 	equals(true, l.LocalTime, t)
 	equals(true, l.Compress, t)
+	equals(2, l.KeepLastDecompressed, t)
 	equals("1:2.3", l.TimeFormat, t)
 	equals("bar", l.BackupDir, t)
 	equals(0, len(md.Undecoded()), t)
+}
+
+func TestShouldCompressFile(t *testing.T) {
+	tests := []struct {
+		name                 string
+		keepLastDecompressed int
+		filename             string
+		fileIndices          []int
+		expected             []bool
+	}{
+		{
+			name:                 "compress all",
+			filename:             "foo.log",
+			fileIndices:          []int{0, 1, 2, 3},
+			keepLastDecompressed: 0,
+			expected:             []bool{true, true, true, true},
+		},
+		{
+			name:                 "leave 2 decompressed",
+			filename:             "foo.log",
+			fileIndices:          []int{0, 1, 2, 3},
+			keepLastDecompressed: 2,
+			expected:             []bool{false, false, true, true},
+		},
+		{
+			name:                 "leave 5 decompressed",
+			filename:             "foo.log",
+			fileIndices:          []int{0, 1, 2, 3},
+			keepLastDecompressed: 5,
+			expected:             []bool{false, false, false, false},
+		},
+		{
+			name:                 "file already compressed",
+			filename:             "foo.log.gz",
+			fileIndices:          []int{0, 1, 2, 3},
+			keepLastDecompressed: 0,
+			expected:             []bool{false, false, false, false},
+		},
+	}
+
+	for _, test := range tests {
+		for _, i := range test.fileIndices {
+			equals(test.expected[i], shouldCompressFile(test.keepLastDecompressed, i, test.filename), t)
+		}
+	}
+
 }
 
 func forEachBackupTestSpec(t *testing.T, do func(t *testing.T, test backupTestSpec)) {
@@ -875,6 +993,10 @@ func logFile(dir string) string {
 }
 
 func backupFile(dir string, opts ...backupFileOpt) string {
+	return backupFileWithTime(dir, fakeTime(), opts...)
+}
+
+func backupFileWithTime(dir string, currTime time.Time, opts ...backupFileOpt) string {
 	options := backupFileOpts{
 		local:      false,
 		timeFormat: DefaultTimeFormat,
@@ -882,7 +1004,6 @@ func backupFile(dir string, opts ...backupFileOpt) string {
 	for _, opt := range opts {
 		opt(&options)
 	}
-	currTime := fakeTime()
 	if !options.local {
 		currTime = currTime.UTC()
 	}
